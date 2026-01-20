@@ -1,6 +1,0 @@
-실행 스크립트: main_####d.py 생성 (main_v2.py 기반)
-설정 파일: configs/dkef_perf/<data_name>.yml 생성
-input_dim: ####
-하이퍼파라미터는 ~와 유사하게 안정성 위주로 설정
-Runner 수정: dkef_runner.py에 <data_name> 데이터셋 로딩 로직 추가
-시각화: visualize_<data_name>_pca.py 생성
