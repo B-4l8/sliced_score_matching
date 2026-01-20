@@ -11,10 +11,18 @@ from tqdm import tqdm
 
 class DKEF(nn.Module):
     def __init__(self, input_dim, mode, num_kernels=1, init_z=None, M=None,
-                 sigma_list=(0.0, 0.5185, 1.0), hidden_dim=30, add_skip=False,
+                 sigma_list=None, hidden_dim=30, num_layers=3, add_skip=False,
                  alpha_param=False, train_Z=True, pretrained_encoder=None, dsm_sigma=None):
         super().__init__()
         self.num_kernels = num_kernels
+        if sigma_list is None:
+            raise ValueError("sigma_list must be provided")
+            # if self.num_kernels == 3:
+            #     sigma_list = (0.0, 0.5185, 1.0)
+            # else:
+            #     # Heuristic: linear space between 0 and 1.5 (approx 1 to 31.6 scale)
+            #     sigma_list = np.linspace(0.0, 1.5, self.num_kernels).tolist()
+
         if mode not in ["exact", "sliced", "sliced_VR", "dsm", "kingma", "CP"]:
             raise ValueError("Unallowable training mode.")
         assert ((mode == "dsm") == (dsm_sigma is not None))
@@ -23,11 +31,11 @@ class DKEF(nn.Module):
         self.input_dim = input_dim
         if self.mode == "kingma" or self.mode == "CP":
             self.kernel = nn.ModuleList([Kernel_approx_bp(self.input_dim,
-                                                hidden_dim=hidden_dim, add_skip=add_skip, sigma_init=sigma_list[i],
+                                                hidden_dim=hidden_dim, num_layers=num_layers, add_skip=add_skip, sigma_init=sigma_list[i],
                                                 pretrained_encoder=pretrained_encoder) for i in range(self.num_kernels)])
         else:
             self.kernel = nn.ModuleList([Kernel(self.input_dim,
-                                                hidden_dim=hidden_dim, add_skip=add_skip, sigma_init=sigma_list[i],
+                                                hidden_dim=hidden_dim, num_layers=num_layers, add_skip=add_skip, sigma_init=sigma_list[i],
                                                 pretrained_encoder=pretrained_encoder) for i in range(self.num_kernels)])
         self.kernel_weights = nn.Parameter(torch.zeros(num_kernels))
         self.q0_sigma = 2.0
@@ -120,7 +128,8 @@ class DKEF(nn.Module):
                     b = self.dsm_sigma ** 2 * (kxz_gradx @ prod_term).squeeze().mean(0)
 
         matrix = G + torch.pow(10., self.log_lambd) * torch.eye(self.M, device=G.device)
-        soln, _ = torch.gesv(-b[:,None], matrix)
+        # 선형시스템 solve 문법 변경
+        soln = torch.linalg.solve(matrix, -b[:,None])
         soln = soln[:,0]
 
         self.alpha.data = soln
@@ -282,11 +291,11 @@ class DKEF(nn.Module):
 
 
 class Kernel(nn.Module):
-    def __init__(self, input_dim, hidden_dim, add_skip, sigma_init=1.0, pretrained_encoder=None):
+    def __init__(self, input_dim, hidden_dim, num_layers, add_skip, sigma_init=1.0, pretrained_encoder=None):
         super().__init__()
         self.input_dim = input_dim
         self.log_sigma = nn.Parameter(torch.tensor(sigma_init))
-        self.phi_w = Phi_w(self.input_dim, hidden_dim=hidden_dim, add_skip=add_skip)
+        self.phi_w = Phi_w(self.input_dim, hidden_dim=hidden_dim, num_layers=num_layers, add_skip=add_skip)
 
         if pretrained_encoder is None:
             def init_weights(m):
@@ -311,19 +320,21 @@ class Kernel(nn.Module):
 
 
 class Phi_w(nn.Module):
-    def __init__(self, input_dim, hidden_dim=30, add_skip=False):
+    def __init__(self, input_dim, hidden_dim=30, num_layers=3, add_skip=False):
         super().__init__()
         self.input_dim = input_dim
         self.add_skip = add_skip
         if add_skip: # Only have bias on the final hidden layer, not the skip.
             self.skip = nn.Linear(self.input_dim, hidden_dim, bias=False)
-        self.net = nn.Sequential(
-            nn.Linear(self.input_dim, hidden_dim),
-            nn.Softplus(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Softplus(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
+        
+        layers = []
+        layers.append(nn.Linear(self.input_dim, hidden_dim))
+        layers.append(nn.Softplus())
+        for _ in range(num_layers - 2):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.Softplus())
+        layers.append(nn.Linear(hidden_dim, hidden_dim))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x):
         if self.add_skip:
@@ -332,69 +343,85 @@ class Phi_w(nn.Module):
             return self.net(x)
 
 class Phi_w_approx_bp(nn.Module):
-    def __init__(self, input_dim, hidden_dim=30, add_skip=False):
+    def __init__(self, input_dim, hidden_dim=30, num_layers=3, add_skip=False):
         super().__init__()
         self.input_dim = input_dim
         self.add_skip = add_skip
+        self.num_layers = num_layers
         if add_skip: # Only have bias on the final hidden layer, not the skip.
             self.skip = models.nice_approxbp.Linear(self.input_dim, hidden_dim, bias=False)
-        self.dense1 = models.nice_approxbp.Linear(self.input_dim, hidden_dim)
-        self.act1 = models.nice_approxbp.Softplus()
-        self.dense2 = models.nice_approxbp.Linear(hidden_dim, hidden_dim)
-        self.act2 = models.nice_approxbp.Softplus()
-        self.dense3 = models.nice_approxbp.Linear(hidden_dim, hidden_dim)
+        
+        self.layers = nn.ModuleList()
+        # Input layer
+        self.layers.append(models.nice_approxbp.Linear(self.input_dim, hidden_dim))
+        self.layers.append(models.nice_approxbp.Softplus())
+        
+        # Hidden layers
+        for _ in range(num_layers - 2):
+            self.layers.append(models.nice_approxbp.Linear(hidden_dim, hidden_dim))
+            self.layers.append(models.nice_approxbp.Softplus())
+            
+        # Output layer
+        self.layers.append(models.nice_approxbp.Linear(hidden_dim, hidden_dim))
 
     def forward(self, x, save_grad):
+        out = x
+        for layer in self.layers:
+            if isinstance(layer, models.nice_approxbp.Linear):
+                out = layer(out)
+            else: # Softplus
+                 out = layer(out, save_grad=save_grad)
+        
         if self.add_skip:
-            return self.dense3(
-                self.act2(self.dense2(
-                    self.act1(self.dense1(x), save_grad=save_grad)), save_grad=save_grad)) + self.skip(x)
+            return out + self.skip(x)
         else:
-            return self.dense3(
-                self.act2(self.dense2(
-                    self.act1(self.dense1(x), save_grad=save_grad)), save_grad=save_grad))
+            return out
 
     def grads_backward(self, grad1, grad2):
-        grad1_net, grad2_net = self.dense1.grads_backward(
-            *self.act1.grads_backward(
-                *self.dense2.grads_backward(
-                    *self.act2.grads_backward(
-                        *self.dense3.grads_backward(grad1, grad2)
-                    )
-                )
-            )
-        )
+        # Backward through skip connection first if it exists
         if self.add_skip:
             grad1_skip, grad2_skip = self.skip.grads_backward(grad1, grad2)
-            grad1_net += grad1_skip
-            grad2_net += grad2_skip
+        
+        # Backward through layers in reverse
+        g1, g2 = grad1, grad2
+        for layer in reversed(self.layers):
+            if isinstance(layer, models.nice_approxbp.Linear):
+                g1, g2 = layer.grads_backward(g1, g2)
+            else:
+                 g1, g2 = layer.grads_backward(g1, g2)
+                 
+        if self.add_skip:
+            g1 += grad1_skip
+            g2 += grad2_skip
 
-        return grad1_net, grad2_net
+        return g1, g2
 
     def grads_backward_S(self, grad1, S_r, S_i):
-        grad1_net, S_rnet, S_inet = self.dense1.grads_backward_S(
-            *self.act1.grads_backward_S(
-                *self.dense2.grads_backward_S(
-                    *self.act2.grads_backward_S(
-                        *self.dense3.grads_backward_S(grad1, S_r, S_i)
-                    )
-                )
-            )
-        )
+        # Backward through skip connection first if it exists
         if self.add_skip:
             grad1_skip, S_rskip, S_iskip = self.skip.grads_backward_S(grad1, S_r, S_i)
-            grad1_net += grad1_skip
-            S_rnet += S_rskip
-            S_inet += S_iskip
 
-        return grad1_net, S_rnet, S_inet
+        # Backward through layers in reverse
+        g1, sr, si = grad1, S_r, S_i
+        for layer in reversed(self.layers):
+            if isinstance(layer, models.nice_approxbp.Linear):
+                g1, sr, si = layer.grads_backward_S(g1, sr, si)
+            else:
+                g1, sr, si = layer.grads_backward_S(g1, sr, si)
+
+        if self.add_skip:
+            g1 += grad1_skip
+            sr += S_rskip
+            si += S_iskip
+
+        return g1, sr, si
 
 class Kernel_approx_bp(nn.Module):
-    def __init__(self, input_dim, hidden_dim, add_skip, sigma_init=1.0, pretrained_encoder=None):
+    def __init__(self, input_dim, hidden_dim, num_layers, add_skip, sigma_init=1.0, pretrained_encoder=None):
         super().__init__()
         self.input_dim = input_dim
         self.log_sigma = nn.Parameter(torch.tensor(sigma_init))
-        self.phi_w = Phi_w_approx_bp(self.input_dim, hidden_dim=hidden_dim, add_skip=add_skip)
+        self.phi_w = Phi_w_approx_bp(self.input_dim, hidden_dim=hidden_dim, num_layers=num_layers, add_skip=add_skip)
 
         if pretrained_encoder is None:
             def init_weights(m):

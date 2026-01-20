@@ -1,5 +1,13 @@
+"""
+01: cuda 사용 가능한 경우 싱크로나이즈
+02: exact score loss 제외(학습속도 개선)
+"""
+
 import os
 import logging
+import matplotlib.pyplot as plt
+import torch
+import numpy as np
 import shutil
 import tensorboardX
 from losses.sliced_sm import *
@@ -13,6 +21,9 @@ import time
 import copy
 from tqdm import tqdm
 import pickle
+from evaluations.hmc import HMCSampler
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
 
 
 __all__ = ['DKEFRunner']
@@ -27,6 +38,79 @@ class SmallDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.data[idx]
+
+
+def compute_sigma_list(dataset, num_kernels):
+    # # Sample a subset for calc
+    # n_samples = min(len(dataset), 1000)
+    # if isinstance(dataset, SmallDataset):
+    #     data_sample = torch.from_numpy(dataset.data[:n_samples])
+    # elif isinstance(dataset, torch.utils.data.Subset):
+    #     # Subset might be shuffled or not, just take first n
+    #     indices = dataset.indices[:n_samples]
+    #     data_sample = dataset.dataset.data[indices]
+    #     if isinstance(data_sample, np.ndarray):
+    #         data_sample = torch.from_numpy(data_sample)
+    # else:
+    #     # Fallback if just a tensor or numpy array
+    #     if hasattr(dataset, 'data'):
+    #          data_sample = torch.from_numpy(dataset.data[:n_samples])
+    #     else:
+    #          data_sample = dataset[:n_samples]
+             
+    # if isinstance(data_sample, np.ndarray):
+    #     data_sample = torch.from_numpy(data_sample)
+    
+    # # Compute pairwise squared distances
+    # # ||x - y||^2 = ||x||^2 + ||y||^2 - 2<x,y>
+    # x = data_sample.float()
+    # x_norm = (x**2).sum(1).view(-1, 1)
+    # y_norm = x_norm.view(1, -1)
+    # dist = x_norm + y_norm - 2.0 * torch.mm(x, x.t())
+    # dist = dist.detach().cpu().numpy()
+    
+    # # We only care about upper triangle (excluding diagonal which is 0)
+    # # But median of full matrix (excluding diag) is fine given symmetry
+    # params = dist[np.triu_indices(n_samples, 1)]
+    # median_dist = np.median(params)
+    
+    # logging.info(f"Median squared distance of data: {median_dist}")
+
+    # # Define multipliers
+    # multipliers = np.logspace(np.log10(0.1), np.log10(2.0), num_kernels).tolist()
+    
+    # # Calculate log_sigma
+    # # 2 * 10^log_sigma = multiplier * median
+    # # 10^log_sigma = multiplier * median / 2
+    # # log_sigma = log10(multiplier * median / 2)
+    
+    # sigma_list = []
+    # actual_sigmas = []
+    # for m in multipliers:
+    #     val = m * median_dist / 2.0
+    #     # safety for log
+    #     if val <= 1e-9: val = 1e-9
+    #     log_sigma = np.log10(val)
+    #     sigma_list.append(log_sigma)
+    #     actual_sigmas.append(val)
+        
+    # logging.info(f"Computed sigma_list (log10): {sigma_list}")
+    # logging.info(f"Computed actual sigmas (10^log_sigma): {actual_sigmas}")
+    #sigma_list = [np.log10(1.0), np.log10(3.3), np.log10(10.0)]
+    print(f"num_kernels: {num_kernels}")
+    if num_kernels == 4:
+        sigma_list = [np.log10(1.0), np.log10(3.3), np.log10(10.0), np.log10(30.0)]
+    elif num_kernels == 5:
+        sigma_list = [np.log10(1.0), np.log10(3.3), np.log10(10.0), np.log10(30.0), np.log10(100.0)]
+    elif num_kernels == 3:
+        sigma_list = [np.log10(1.0), np.log10(3.3), np.log10(10.0)]
+    elif num_kernels == 2:
+        sigma_list = [np.log10(1.0), np.log10(10.0)]
+    elif num_kernels == 1:
+        sigma_list = [np.log10(1.0)]
+    
+
+    return sigma_list
 
 
 class DKEFRunner():
@@ -44,6 +128,53 @@ class DKEFRunner():
         else:
             raise NotImplementedError('Optimizer {} not understood.'.format(self.config.optim.optimizer))
 
+    def _apply_scaler(self, dataset):
+        scaler_type = getattr(self.config.data, 'scaler', 'pca_whiten')
+        logging.info(f"Selected Scaler: {scaler_type}")
+        
+        if scaler_type == 'standard':
+            logging.info("Applying StandardScaler")
+            self.scaler = StandardScaler()
+            dataset = self.scaler.fit_transform(dataset)
+        elif scaler_type == 'pca_whiten':
+            logging.info("Applying PCA(n_comp=0.999, whiten=True)")
+            # Using 0.99 variance retention or full dim based on previous feedback/context?
+            # Default to full dim for stability unless specified otherwise, but user had n_components=0.99 previously
+            # Let's stick to full dim matching input shape as a safe default for "whiten" logic 
+            # unless we want to support dimensionality reduction too.
+            # Given previous error "n_components=500 must be between...", safer to use min(dim, samples) logic implicitly or explicitly.
+            # PCA(n_components=dim) handles it if n_samples > dim.
+            dim = dataset.shape[1]
+            self.scaler = PCA(n_components=0.999, whiten=True)
+            try:
+                dataset = self.scaler.fit_transform(dataset)
+                logging.info(f"PCA components: {self.scaler.n_components_}")
+            except ValueError as e:
+                # Fallback or re-raise
+                logging.error(f"PCA failed (likely n_samples < n_features): {e}")
+                raise e
+        elif scaler_type == 'whiten':
+            logging.info("Applying PCA(whiten=True)")
+            # Using 0.99 variance retention or full dim based on previous feedback/context?
+            # Default to full dim for stability unless specified otherwise, but user had n_components=0.99 previously
+            # Let's stick to full dim matching input shape as a safe default for "whiten" logic 
+            # unless we want to support dimensionality reduction too.
+            # Given previous error "n_components=500 must be between...", safer to use min(dim, samples) logic implicitly or explicitly.
+            # PCA(n_components=dim) handles it if n_samples > dim.
+            dim = dataset.shape[1]
+            self.scaler = PCA(whiten=True)
+            try:
+                dataset = self.scaler.fit_transform(dataset)
+                logging.info(f"PCA components: {self.scaler.n_components_}")
+            except ValueError as e:
+                # Fallback or re-raise
+                logging.error(f"PCA failed (likely n_samples < n_features): {e}")
+                raise e        
+        else:
+            raise ValueError(f"Unknown scaler type: {scaler_type}")
+            
+        return dataset
+
     def get_dataset(self):
         # NOTE: in their code, they add the noise to the dataset. (They also have the option to add during
         # train time, but it is not the default).
@@ -55,13 +186,44 @@ class DKEFRunner():
             val_data = SmallDataset(val_data + torch.randn_like(val_data) * 0.05)
             test_data = torch.tensor(test_data).float()
             test_data = SmallDataset(test_data + torch.randn_like(test_data) * 0.05)
+
         elif self.config.data.dataset == "HighDim":
             train_data = SmallDataset(np.random.randn(4860, self.args.scalability_dim).astype(np.float32))
             val_data = SmallDataset(np.random.randn(540, self.args.scalability_dim).astype(np.float32))
             test_data = SmallDataset(np.random.randn(600, self.args.scalability_dim).astype(np.float32))
             self.config.data.input_dim = self.args.scalability_dim
+
+        elif self.config.data.dataset.startswith("Synthetic"):
+            # Generic loading for Synthetic data
+            # Assumes file is at data/{dim}d/synthetic_pos.csv
+            dim = self.config.data.input_dim
+            data_path = f"data/{dim}d/synthetic_pos.csv"
+            logging.info(f"Loading Synthetic data from {data_path}")
+            try:
+                # Load CSV, skip header
+                dataset = np.loadtxt(data_path, delimiter=",", skiprows=1)
+                
+                # Apply Scaler
+                dataset = self._apply_scaler(dataset)
+                logging.info(f"Dataset shape after scaling: {dataset.shape}")
+
+                # Split into train/val/test
+                # Shuffle
+                np.random.shuffle(dataset)
+                n = len(dataset)
+                n_train = int(n * 0.6)
+                
+                train_data = SmallDataset(dataset[:n_train].astype(np.float32))
+                # 1:1 Split requested. Using the remaining 50% as Test data.
+                test_data = SmallDataset(dataset[n_train:].astype(np.float32))
+                val_data = test_data
+                
+                self.config.data.input_dim = dataset.shape[1]
+            except Exception as e:
+                logging.error(f"Failed to load {data_path}: {e}")
+                raise e
         else:
-            raise ValueError("Only supports UCI datasets or high dimensional synthetic data")
+            raise ValueError("Only supports UCI datasets, high dimensional synthetic data, CreditCard, Seizure, HumanActivity, Wifi, or Synthetic")
         return train_data, val_data, test_data
 
     def clean_data(self, data, cor=0.98):
@@ -159,7 +321,10 @@ class DKEFRunner():
         best_model = None
         train_losses = np.zeros(30)
         val_loss_window = np.zeros(15)
-        torch.cuda.synchronize()
+        # Loss Tracking
+        self.loss_history = {'step': [], 'train': [], 'val': []}
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         prev_time = time.time()
 
         val_batch_size = len(val_data)
@@ -203,7 +368,8 @@ class DKEFRunner():
                 tn = nn.utils.clip_grad_norm_(dkef.parameters(), 100.0)
                 optimizer.step()
 
-                idx = np.random.choice(len(train_data), 1000, replace=False)
+                num_samples = min(1000, len(train_data))
+                idx = np.random.choice(len(train_data), num_samples, replace=False)
                 train_data_for_val = torch.utils.data.Subset(train_data, idx)
                 dkef.save_alpha_matrices(train_data_for_val, collate_fn, self.config.device)
 
@@ -245,17 +411,24 @@ class DKEFRunner():
                     self.results["its_per_sec"] = 1. / self.results["secs_per_it"]
                     logging.info("Validation loss has not improved in {} steps. Finalizing model!"
                                  .format(self.config.training.patience))
+                    self.plot_loss_curve(self.loss_history)
                     return best_model
 
                 mean_train_loss = train_losses[:step+1].mean() if step < 30 else train_losses.mean()
-                logging.info("Step {}, Training loss: {:.2f}, validation loss: {:.2f}".format(step, mean_train_loss, best_val_loss))
+                
+                self.loss_history['step'].append(step)
+                self.loss_history['train'].append(mean_train_loss.item())
+                self.loss_history['val'].append(val_loss.item())
+
+                logging.info("Step {}, Training loss: {:.2f}, Val loss: {:.2f} (Best: {:.2f})".format(step, mean_train_loss, val_loss, best_val_loss))
                 tb_logger.add_scalar('train/train_loss_smoothed', mean_train_loss, global_step=step)
                 tb_logger.add_scalar('train/best_val_loss', best_val_loss, global_step=step)
                 tb_logger.add_scalar('train/train_loss', train_loss, global_step=step)
                 tb_logger.add_scalar('train/val_loss', val_loss, global_step=step)
 
                 if step % 20 == 0:
-                    torch.cuda.synchronize()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
                     new_time = time.time()
                     logging.info("#" * 80)
                     if step > 0:
@@ -266,18 +439,20 @@ class DKEFRunner():
                     if step > 0:
                         total_time += new_time - prev_time
 
-                    val_losses_exact = []
-                    for val_step in range(num_val_iters):
-                        val_iter, data_v = self.sample(val_iter, val_loader)
-                        vle = exact_score_matching(energy_net_val, data_v, train=False)
-                        val_losses_exact.append(vle.mean())
+                    # exact score loss
+                    # val_losses_exact = []
+                    # for val_step in range(num_val_iters):
+                    #     val_iter, data_v = self.sample(val_iter, val_loader)
+                    #     vle = exact_score_matching(energy_net_val, data_v, train=False)
+                    #     val_losses_exact.append(vle.mean())
 
-                    val_loss_exact = sum(val_losses_exact) / len(val_losses_exact)
-                    logging.info("Exact score matching loss on val: {:.2f}".format(val_loss_exact.mean()))
-                    tb_logger.add_scalar('eval/exact_score_matching', val_loss_exact.mean(), global_step=step)
+                    # val_loss_exact = sum(val_losses_exact) / len(val_losses_exact)
+                    # logging.info("Exact score matching loss on val: {:.2f}".format(val_loss_exact.mean()))
+                    # tb_logger.add_scalar('eval/exact_score_matching', val_loss_exact.mean(), global_step=step)
 
                     logging.info("#" * 80)
-                    torch.cuda.synchronize()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
                     prev_time = time.time()
                 step += 1
 
@@ -285,9 +460,22 @@ class DKEFRunner():
         self.results["secs_per_it"] = sum(secs_per_it) / len(secs_per_it)
         self.results["its_per_sec"] = 1. / self.results["secs_per_it"]
 
+        self.plot_loss_curve(self.loss_history)
+        
+        # Save model
+        model_path = os.path.join(self.args.run, 'results', self.args.doc)
+        logging.info(f"Saving best model to {model_path}/model.pt")
+        torch.save(best_model, os.path.join(model_path, "model.pt"))
+        
         return best_model
 
     def finalize(self, dkef, tb_logger, train_data, val_data, test_data, collate_fn, train_mode):
+        if hasattr(self, 'scaler'):
+            model_path = os.path.join(self.args.run, 'results', self.args.doc)
+            logging.info(f"Saving scaler to {model_path}/scaler.pkl")
+            with open(os.path.join(model_path, "scaler.pkl"), "wb") as f:
+                pickle.dump(self.scaler, f)
+
         lambda_params = [param for (name, param) in dkef.named_parameters() if "lambd" in name]
         optimizer = optim.Adam(lambda_params, lr=0.001)
         batch_size = self.config.training.fval_batch_size
@@ -337,7 +525,7 @@ class DKEFRunner():
         val_loss = sum(val_losses) / len(val_losses)
         logging.info("Overall val exact score matching: {:.3f}".format(val_loss))
         tb_logger.add_scalar('finalize/final_valid_score', val_loss, global_step=0)
-        self.results["final_valid_score"] = np.asscalar(val_loss.cpu().numpy())
+        self.results["final_valid_score"] = val_loss.cpu().numpy().item()
 
         test_losses = []
         for data_t in test_loader:
@@ -347,7 +535,7 @@ class DKEFRunner():
         test_loss = sum(test_losses) / len(test_losses)
         logging.info("Overall test exact score matching: {:.3f}".format(test_loss))
         tb_logger.add_scalar('finalize/final_test_score', test_loss, global_step=0)
-        self.results["final_test_score"] = np.asscalar(test_loss.cpu().numpy())
+        self.results["final_test_score"] = test_loss.cpu().numpy().item()
 
     def eval(self, dkef, tb_logger, train_data, val_data, test_data, collate_fn, train_mode):
         q = torch.distributions.MultivariateNormal(torch.zeros(train_data.data.shape[1]), torch.eye(train_data.data.shape[1]) * 4.)
@@ -401,8 +589,11 @@ class DKEFRunner():
             fisher_divergence_test = self.fisher_divergence(energy_net, next(iter(test_loader)), gt_logpdf_net)
             logging.info("Fisher divergence on val and test: {}, {}".format(fisher_divergence_val, fisher_divergence_test))
 
-            self.results['fisher_divergence_val'] = np.asscalar(fisher_divergence_val.numpy())
-            self.results['fisher_divergence_test'] = np.asscalar(fisher_divergence_test.numpy())
+            self.results['fisher_divergence_val'] = fisher_divergence_val.numpy().item()
+            self.results['fisher_divergence_test'] = fisher_divergence_test.numpy().item()
+
+    # v2 sampling
+
 
     def train(self):
         train_data, val_data, test_data = self.get_dataset()
@@ -437,26 +628,38 @@ class DKEFRunner():
             self.dsm_sigma = None
 
         # Initialize the model
+        print(len(train_data))
         init_z_subset = torch.utils.data.Subset(train_data, np.random.choice(len(train_data),
                                                                              self.config.model.M, replace=False))
         init_z_loader = DataLoader(init_z_subset, batch_size=len(init_z_subset), collate_fn=collate_fn)
         init_z = next(iter(init_z_loader)).clone()
+        num_layers = getattr(self.config.model, 'num_layers', 3)
+        
+        # Calculate sigma_list heuristic
+        sigma_list = compute_sigma_list(train_data, self.config.model.num_kernels)
+        
         dkef = DKEF(self.config.data.input_dim, mode=self.config.training.algo,
                     num_kernels=self.config.model.num_kernels,
-                    init_z=init_z, hidden_dim=self.config.model.hidden_dim, add_skip=self.config.model.add_skip,
+                    init_z=init_z, hidden_dim=self.config.model.hidden_dim, 
+                    num_layers=num_layers, add_skip=self.config.model.add_skip,
                     alpha_param=self.config.model.alpha_param, train_Z=self.config.model.train_Z,
-                    pretrained_encoder=None, dsm_sigma=self.dsm_sigma).to(self.config.device)
+                    pretrained_encoder=None, dsm_sigma=self.dsm_sigma, sigma_list=sigma_list).to(self.config.device)
 
         # Train the model
         state_dict = self.train_stage1(dkef, tb_logger, train_data, val_data,
                                        collate_fn=collate_fn, train_mode=self.config.training.algo)
 
+        # Save model (handle early stopping case where train_stage1 might not save)
+        logging.info(f"Saving best model to {model_path}/model.pt")
+        torch.save(state_dict, os.path.join(model_path, "model.pt"))
+
         # Reload the model (modifiable to load saved model)
         best_dkef = DKEF(self.config.data.input_dim, mode=self.config.training.algo,
                     num_kernels=self.config.model.num_kernels,
-                    init_z=init_z, hidden_dim=self.config.model.hidden_dim, add_skip=self.config.model.add_skip,
+                    init_z=init_z, hidden_dim=self.config.model.hidden_dim, 
+                    num_layers=num_layers, add_skip=self.config.model.add_skip,
                     alpha_param=self.config.model.alpha_param, train_Z=self.config.model.train_Z,
-                         pretrained_encoder=None, dsm_sigma=self.dsm_sigma).to(self.config.device)
+                         pretrained_encoder=None, dsm_sigma=self.dsm_sigma, sigma_list=sigma_list).to(self.config.device)
         best_dkef.load_state_dict(state_dict)
 
         # Finalize (learn hyperparameters using second step) and evaluate
@@ -464,9 +667,105 @@ class DKEFRunner():
                       collate_fn=collate_fn, train_mode=self.config.training.algo)
         self.eval(best_dkef, tb_logger, train_data, val_data, test_data,
                       collate_fn=collate_fn, train_mode=self.config.training.algo)
-        torch.save(best_dkef.state_dict(), model_path + "/model.pth")
+        
 
-        logging.info(self.results)
-        pickle_out = open(model_path + "/results.pkl", "wb")
-        pickle.dump(self.results, pickle_out)
-        pickle_out.close()
+
+        # Print kernel weights and sigmas
+        kernel_weights = torch.softmax(best_dkef.kernel_weights, dim=0).detach().cpu().numpy()
+        logging.info("Kernel Weights and Sigmas:")
+        for i, (weight, kernel) in enumerate(zip(kernel_weights, best_dkef.kernel)):
+            sigma = torch.pow(10.0, kernel.log_sigma).detach().cpu().item()
+            logging.info("Kernel {}: Weight = {:.4f}, Sigma = {:.6f}".format(i, weight, sigma))
+
+        max_weight_idx = np.argmax(kernel_weights)
+        selected_sigma = torch.pow(10.0, best_dkef.kernel[max_weight_idx].log_sigma).detach().cpu().item()
+        logging.info("Most dominant kernel: Kernel {} with Weight = {:.4f} and Sigma = {:.6f}".format(max_weight_idx, kernel_weights[max_weight_idx], selected_sigma))
+
+        # v2: sampling
+        # Generate samples using HMCSampler
+        logging.info("Generating samples using HMCSampler(MALA)...")
+        import re
+
+        # Generate samples
+        if self.config.model.train_Z:
+            try:
+                raw_input = input("How many samples?")
+                # Remove ANSI escape sequences and non-digits
+                clean_input = re.sub(r'\D', '', raw_input)
+                if clean_input:
+                    n_samples = int(clean_input)
+                else:
+                    print("Invalid input. Defaulting to 1000.")
+                    n_samples = 1000
+            except Exception as e:
+                print(f"Error reading input ({e}). Defaulting to 1000.")
+                n_samples = 1000
+        else:
+            n_samples = 1000
+
+
+        # Energy function for HMCSampler
+        def energy_fn(x):
+             # HMCSampler expects energy = -log_prob
+             # dkef(..., stage="eval") returns unnormalized log_prob
+             return -best_dkef(None, x, stage="eval")
+             
+        # Instantiate HMCSampler
+        # n_steps=10 introduces momentum (HMC) which is better for high-dim data than MALA (n_steps=1)
+        hmc_sampler = HMCSampler(energy_fn, stepsize=0.1, n_steps=2)
+        
+        # Run sampling in batches
+        batch_size = getattr(self.config.training, 'sampling_batch_size', 1000)
+        generated_samples_list = []
+        total_acc_rate = 0
+        num_batches = (n_samples + batch_size - 1) // batch_size
+        
+        logging.info(f"Generating {n_samples} samples in {num_batches} batches (batch size: {batch_size})")
+
+        for i in range(num_batches):
+            current_batch_size = min(batch_size, n_samples - i * batch_size)
+            logging.info(f"Batch {i+1}/{num_batches}: Generating {current_batch_size} samples...")
+            
+            initial_samples = torch.randn(current_batch_size, self.config.data.input_dim).to(self.config.device)
+            batch_samples = hmc_sampler.run_hmc_sampler(initial_samples, num_steps=100)
+            
+            generated_samples_list.append(batch_samples.detach().cpu()) # Move to CPU immediately to free GPU
+            total_acc_rate += hmc_sampler.avg_acceptance_rate
+            
+            # Clear cache if needed (optional but good for OOM)
+            torch.cuda.empty_cache()
+
+        # Concatenate all batches
+        generated_samples = torch.cat(generated_samples_list, dim=0).numpy()
+        
+        # Average acceptance rate
+        avg_acceptance_rate_final = total_acc_rate / num_batches
+        hmc_sampler.avg_acceptance_rate = avg_acceptance_rate_final # Update for logging
+
+        # Inverse transform if scaler exists
+        
+        logging.info("Inverse transforming generated samples using fitted Scaler (PCA/StandardScaler)")
+        generated_samples = self.scaler.inverse_transform(generated_samples)
+
+        logging.info("HMC Final Step Size: {:.6f}".format(hmc_sampler.stepsize))
+        logging.info("HMC Average Acceptance Rate: {:.4f}".format(hmc_sampler.avg_acceptance_rate))
+        
+        np.save(os.path.join(model_path, "generated_samples.npy"), generated_samples)
+
+    def plot_loss_curve(self, history):
+        try:
+            plt.figure(figsize=(10, 6))
+            plt.plot(history['step'], history['train'], label='Train Loss (Smoothed)', alpha=0.7)
+            plt.plot(history['step'], history['val'], label='Val Loss', alpha=0.7)
+            plt.xlabel('Step')
+            plt.ylabel('Loss')
+            plt.title(f'Training and Validation Loss ({self.args.doc})')
+            plt.legend()
+            plt.grid(True)
+            
+            save_path = os.path.join(self.args.log, 'loss_curve.png')
+            plt.savefig(save_path)
+            plt.close()
+            logging.info(f"Loss curve saved to {save_path}")
+        except Exception as e:
+            logging.error(f"Failed to plot loss curve: {e}")

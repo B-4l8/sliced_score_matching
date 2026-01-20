@@ -1,0 +1,3 @@
+python main_synthetic.py --config dkef_perf/synthetic_{dim}.yml --doc synthetic_{dim}_exp01
+python sample_dkef.py --config dkef_perf/synthetic_{dim}.yml --doc synthetic_{dim}_exp01 --samples 900
+python visualize_synthetic.py --doc synthetic_{dim}_exp01 --dim {dim}

@@ -1,0 +1,18 @@
+name: ssm_3070
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.8
+  - pytorch>=1.10.0
+  - torchvision
+  - pytorch-cuda=11.7
+  - tqdm
+  - scipy
+  - pyyaml
+  - pip
+  - pip:
+    - tensorboardX
+    - tensorboard
