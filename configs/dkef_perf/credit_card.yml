@@ -1,0 +1,23 @@
+training:
+  algo: sliced
+  n_epochs: 3000
+  batch_size: 50
+  fval_batch_size: 50
+  patience: 500
+
+data:
+  dataset: CreditCard
+  input_dim: 28
+
+model:
+  M: 50
+  num_kernels: 4
+  hidden_dim: 64
+  add_skip: True
+  alpha_param: False
+  train_Z: True
+  
+optim:
+  optimizer: Adam
+  lr: 0.0001
+  weight_decay: 0.0

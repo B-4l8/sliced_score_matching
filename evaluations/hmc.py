@@ -69,7 +69,7 @@ class HMCSampler(object):
     def __init__(self, model_energy_fn,
                  stepsize=0.01, n_steps=10,
                  target_acceptance_rate=.65, avg_acceptance_slowness=0.9,
-                 stepsize_min=0.0001, stepsize_max=1.0, stepsize_dec=0.98, stepsize_inc=1.02):
+                 stepsize_min=0.0001, stepsize_max=3.0, stepsize_dec=0.98, stepsize_inc=1.02):
         """
         Compute samples from a given energy based model.
 
@@ -98,9 +98,10 @@ class HMCSampler(object):
         self.target_acceptance_rate = target_acceptance_rate
         self.avg_acceptance_slowness = avg_acceptance_slowness
 
-    def run_hmc_sampler(self, x, num_steps):
+    def run_hmc_sampler(self, x, num_steps, return_trace=False):
         stepsize = self.stepsize
         avg_acceptance_rate = self.avg_acceptance_rate
+        trace = []
 
         for _ in tqdm(range(num_steps)):
             accept, final_pos, final_vel = hmc_move(
@@ -123,7 +124,12 @@ class HMCSampler(object):
                 target_acceptance_rate=self.target_acceptance_rate,
                 avg_acceptance_slowness=self.avg_acceptance_slowness
             )
-
+            
+            if return_trace:
+                trace.append(x.detach().cpu())
 
         self.avg_acceptance_rate = avg_acceptance_rate
+        
+        if return_trace:
+            return x, torch.stack(trace)
         return x

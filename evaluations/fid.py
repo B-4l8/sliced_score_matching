@@ -39,7 +39,12 @@ from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 import numpy as np
 import torch
 from scipy import linalg
-from scipy.misc import imread
+
+#v2
+from PIL import Image
+# v1
+# from scipy.misc import imread
+
 from torch.nn.functional import adaptive_avg_pool2d
 
 try:
@@ -108,8 +113,13 @@ def get_activations(files, model, batch_size=50, dims=2048,
         start = i * batch_size
         end = start + batch_size
 
-        images = np.array([imread(str(f)).astype(np.float32)
+        # v2
+        images = np.array([np.array(Image.open(str(f))).astype(np.float32)
                            for f in files[start:end]])
+
+        # v1
+        # images = np.array([imread(str(f)).astype(np.float32)
+        #                    for f in files[start:end]])
 
         # Reshape to (n_images, 3, height, width)
         images = images.transpose((0, 3, 1, 2))

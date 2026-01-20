@@ -1,0 +1,25 @@
+training:
+  algo: sliced_VR
+  n_epochs: 1000
+  batch_size: 128
+  fval_batch_size: 128
+  patience: 200
+
+data:
+  dataset: Synthetic100
+  input_dim: 100
+  scaler: pca_whiten
+
+model:
+  M: 200
+  num_kernels: 3
+  hidden_dim: 64
+  num_layers: 3
+  add_skip: True
+  alpha_param: False       
+  train_Z: True
+  
+optim:
+  optimizer: Adam
+  lr: 0.01
+  weight_decay: 0.0
