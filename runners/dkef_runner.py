@@ -109,7 +109,6 @@ def compute_sigma_list(dataset, num_kernels):
     elif num_kernels == 1:
         sigma_list = [np.log10(1.0)]
     
-
     return sigma_list
 
 
@@ -138,12 +137,6 @@ class DKEFRunner():
             dataset = self.scaler.fit_transform(dataset)
         elif scaler_type == 'pca_whiten':
             logging.info("Applying PCA(n_comp=0.999, whiten=True)")
-            # Using 0.99 variance retention or full dim based on previous feedback/context?
-            # Default to full dim for stability unless specified otherwise, but user had n_components=0.99 previously
-            # Let's stick to full dim matching input shape as a safe default for "whiten" logic 
-            # unless we want to support dimensionality reduction too.
-            # Given previous error "n_components=500 must be between...", safer to use min(dim, samples) logic implicitly or explicitly.
-            # PCA(n_components=dim) handles it if n_samples > dim.
             dim = dataset.shape[1]
             self.scaler = PCA(n_components=0.999, whiten=True)
             try:
@@ -155,12 +148,6 @@ class DKEFRunner():
                 raise e
         elif scaler_type == 'whiten':
             logging.info("Applying PCA(whiten=True)")
-            # Using 0.99 variance retention or full dim based on previous feedback/context?
-            # Default to full dim for stability unless specified otherwise, but user had n_components=0.99 previously
-            # Let's stick to full dim matching input shape as a safe default for "whiten" logic 
-            # unless we want to support dimensionality reduction too.
-            # Given previous error "n_components=500 must be between...", safer to use min(dim, samples) logic implicitly or explicitly.
-            # PCA(n_components=dim) handles it if n_samples > dim.
             dim = dataset.shape[1]
             self.scaler = PCA(whiten=True)
             try:
